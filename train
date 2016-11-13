@@ -1,0 +1,120 @@
+# coding:utf-8
+
+'''
+__name__ ='train'
+__Audthor__ = 'zzds'
+__version__ ='0.1.0'
+'''
+import data_pro as dp
+import numpy as np
+import pandas as pd
+import os, sys
+from datetime import datetime, timedelta
+import copy
+import re
+import xgboost as xgb
+from sklearn.cross_validation import train_test_split
+
+os.chdir(os.path.dirname(sys.argv[0]))
+sys.path.append(os.getcwd())
+
+
+#write correct borrow_train
+def rewrite():
+    borrow_train = open(r'.\data\train\borrow_train.txt','r')
+    new_borrow = open(r'.\data\train\new_borrow_train.txt','ab+')
+    borrow_data = []
+    for line in borrow_train.readlines():
+        if line.count('"')%2 == 0:
+            borrow_data.append(line)
+    borrow_train.close()
+    for datas in borrow_data:
+        new_borrow.write(datas) 
+    new_borrow.close()
+#rewrite()
+    
+#导入数据
+borrow_train = pd.read_csv(r'.\data\train\new_borrow_train.txt',header=None,names=['stu_id','borrow_date','book_name','book_type'],parse_dates = ['borrow_date'],encoding="utf-8")
+dorm_train = pd.read_csv(r'.\data\train\dorm_train.txt',header=None,names=['stu_id','act_time','direction'],parse_dates = ['act_time'])
+card_train = pd.read_csv(r'.\data\train\card_train.txt',header=None,names=['stu_id','cost_type','cost_pos','cost_reason','cost_time','cost_amount','rest_amount'])
+library_train = pd.read_csv(r'.\data\train\library_train.txt',header=None,names=['stu_id','gate','time'],parse_dates = ['time'])
+score_train = pd.read_csv(r'.\data\train\score_train.txt',header=None,names=['stu_id','department_id','rank'])
+subsidy_train = pd.read_csv(r'.\data\train\subsidy_train.txt',header=None,names=['stu_id','subsidy'])
+#去重
+borrow_train.drop_duplicates(inplace = True)
+dorm_train.drop_duplicates(inplace = True)
+library_train.drop_duplicates(inplace = True)
+card_train.drop_duplicates(inplace = True)
+#查看各种开销的类型
+for cost_reason in list(card_train.cost_reason.unique()):
+    print cost_reason
+
+#borrow data
+def cope_borrow_data(borrow_train):
+    pattern = r'[A-Z0-9]+'
+    #regex = re.compile(pattern,flags = re.IGNORECASE)
+    borrow_train.book_type =  borrow_train.book_type.str.split(' ',expand = True).iloc[:,0].fillna('NAN').str.findall(pattern,flags = re.IGNORECASE)
+    #find false data
+    #data = []
+    #for i,i_type in enumerate(book_type):
+    #    data.append(regex.findall(i_type)[0])
+    #borrow_train.iloc[i]
+    borrow_train['book_type'] = borrow_train['book_type'].apply(lambda x:x[0])
+    return
+cope_borrow_data(borrow_train)
+
+groupcard = card_train.groupby(['cost_reason','stu_id'])[['cost_amount']].sum()
+groupborrow = borrow_train.groupby(['book_type','stu_id'])[['book_name']].count().rename(columns = {'book_name':'borrow_count'}).sum(level = 1).reset_index()
+grouplibrary = library_train.groupby('stu_id',as_index = False)[['time']].count().rename(columns = {'time':'libraryCount'})
+groupdorm = dorm_train.groupby(['direction','stu_id'])[['act_time']].count().rename(columns = {'act_time':'dormCount'})
+
+def groupMerge(target,data,col):
+    index1 = data.index.levels[0]
+    for i_index in index1:
+        tmp = data.ix[i_index].reset_index().rename(columns = {col:col+str(i_index)})
+        target = target.merge(tmp,on = 'stu_id',how = 'left')
+    return target
+#features (简单)
+train_data = subsidy_train.copy()
+train_data = train_data.merge(score_train,on = 'stu_id',how = 'left').fillna(-1)
+train_data = groupMerge(train_data,groupcard,'cost_amount').fillna(0)
+train_data = train_data.merge(groupborrow,on = 'stu_id',how = 'left').fillna(0)
+train_data = train_data.merge(grouplibrary,on = 'stu_id',how = 'left').fillna(0)
+train_data = groupMerge(train_data,groupdorm,'dormCount').fillna(-1)
+#构造模型
+feature = list(train_data.columns)
+feature.remove('subsidy')
+train_X = train_data[feature]
+train_y = train_data['subsidy'].replace({1000:1,1500:2,2000:3})
+
+X_train_raw,X_test_raw,y_train,y_test = train_test_split(train_X,train_y,train_size = 0.5)  #没有成绩的到底要不要加？
+
+
+
+
+def xgb_train(X_train_raw,y_train,X_test_raw,y_test):
+    param = {}  
+    # use softmax multi-class classification  
+    param['objective'] = 'multi:softmax'  
+    param['eta'] = 0.1  
+    param['max_depth'] = 6  
+    param['silent'] = 0  
+    param['nthread'] = 4
+    param['subsample'] = 0.9
+    param['colsample_bytree']= 0.9
+    param['min_child_weight'] = 10
+    param['booster'] = "gbtree"
+    param['seed'] = 2016   
+    param['num_class'] = 4  
+    num_round = 120
+    Dtrain = xgb.DMatrix(X_train_raw,label = y_train)
+    Dtest = xgb.DMatrix(X_test_raw,label = y_test)
+    watchlist  = [(Dtrain,'train'),(Dtest,'test')]
+    clf = xgb.train(param,Dtrain,num_round,watchlist)
+    return clf,Dtest
+
+clf,Dtest = xgb_train(X_train_raw,y_train,X_test_raw,y_test)
+predict = clf.predict(Dtest)
+dp.classifiactin_result(y_test,predict)
+
+clf.save_model(r'.\model\myxgb_1.m')  
