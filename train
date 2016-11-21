@@ -14,6 +14,7 @@ import copy
 import re
 import xgboost as xgb
 from sklearn.cross_validation import train_test_split
+from sklearn.cluster import KMeans
 
 os.chdir(os.path.dirname(sys.argv[0]))
 sys.path.append(os.getcwd())
@@ -36,18 +37,47 @@ def rewrite():
 #导入数据
 borrow_train = pd.read_csv(r'.\data\train\new_borrow_train.txt',header=None,names=['stu_id','borrow_date','book_name','book_type'],parse_dates = ['borrow_date'],encoding="utf-8")
 dorm_train = pd.read_csv(r'.\data\train\dorm_train.txt',header=None,names=['stu_id','act_time','direction'],parse_dates = ['act_time'])
-card_train = pd.read_csv(r'.\data\train\card_train.txt',header=None,names=['stu_id','cost_type','cost_pos','cost_reason','cost_time','cost_amount','rest_amount'])
+card_train = pd.read_csv(r'.\data\train\card_train.txt',header=None,names=['stu_id','cost_type','cost_pos','cost_reason','cost_time','cost_amount','rest_amount'],parse_dates = ['cost_time'])
 library_train = pd.read_csv(r'.\data\train\library_train.txt',header=None,names=['stu_id','gate','time'],parse_dates = ['time'])
 score_train = pd.read_csv(r'.\data\train\score_train.txt',header=None,names=['stu_id','department_id','rank'])
 subsidy_train = pd.read_csv(r'.\data\train\subsidy_train.txt',header=None,names=['stu_id','subsidy'])
 #去重
+card_train = card_train[card_train.cost_amount>0] #沃日
 borrow_train.drop_duplicates(inplace = True)
 dorm_train.drop_duplicates(inplace = True)
 library_train.drop_duplicates(inplace = True)
 card_train.drop_duplicates(inplace = True)
-#查看各种开销的类型
-for cost_reason in list(card_train.cost_reason.unique()):
-    print cost_reason
+
+################################################数据预处理 （主要是card_train）##################################################
+card_train['year'] = card_train.cost_time.dt.year
+card_train['weekday'] = card_train.cost_time.dt.weekday+1
+card_train['weekofyear'] = card_train.cost_time.dt.weekofyear
+card_train['date'] = card_train.cost_time.dt.date
+card_train['weekend'] = card_train.weekday.apply(lambda x :'weekend' if x>5 else 'not_weekend')
+
+#去除从不使用卡的记录
+user_card_last_time  = card_train.groupby(['stu_id'])['cost_time'].max() - card_train.groupby(['stu_id'])['cost_time'].min()
+user_card_date_counts = card_train.groupby(['stu_id'])['date'].unique().apply(lambda x:len(x)).to_frame().rename(columns = {'date':'count_date'})
+user_card_date_counts.reset_index(inplace = True)
+user_card_last_time = user_card_last_time.to_frame().reset_index()
+user_card_last_time.cost_time = user_card_last_time.cost_time.dt.days
+user_card_last_time = user_card_last_time.rename(columns = {'cost_time':'timediff'})
+card_train[~card_train.stu_id.isin(user_card_last_time.stu_id)]
+stu_year = card_train.groupby(['stu_id'])['cost_time'].max().dt.year.to_frame().rename(columns = {'cost_time':'subsidy_year'}).reset_index()
+stu_year.subsidy_year = stu_year.subsidy_year.apply(lambda x: 2014 if x==2015 else 2013)
+subsidy_train = subsidy_train[subsidy_train.stu_id.isin(user_card_last_time.stu_id)]#去除训练集中从来没有出现过得数据
+subsidy_train = subsidy_train.merge(stu_year,on = 'stu_id')
+#查找交互记录少于N天的人的助学金信息
+subsidy_train[user_card_last_time.timediff<10]['subsidy'].value_counts()
+subsidy_train[(user_card_date_counts.count_date<20).values]['subsidy'].value_counts()
+
+##查看各种开销的类型
+#for cost_reason in list(card_train.cost_reason.unique()):
+#    print cost_reason
+#for cost_type in list(card_train.cost_type.unique()):
+#    print cost_type
+#for cost_pos in list(card_train.cost_pos.unique()):
+#    print cost_pos
 
 #borrow data
 def cope_borrow_data(borrow_train):
@@ -63,58 +93,224 @@ def cope_borrow_data(borrow_train):
     return
 cope_borrow_data(borrow_train)
 
-groupcard = card_train.groupby(['cost_reason','stu_id'])[['cost_amount']].sum()
+#特征
+cost_sum = card_train.groupby(['stu_id'],as_index = False)[['cost_amount']].sum().rename(columns = {'cost_amount':'cost_amount_sum'})
+rest_mean = card_train.groupby(['stu_id'],as_index = False)[['rest_amount']].mean().rename(columns = {'rest_amount':'rest_amount_mean'})
+groupcard_cost_mean = card_train.groupby(['cost_reason','stu_id'])[['cost_amount']].mean().rename(columns = {'cost_amount':'cost_amount_mean'})
+groupcard_cost_type_sum = card_train.groupby(['cost_type','stu_id'])[['cost_amount']].sum().rename(columns = {'cost_amount':'cost_amount_sum'})
+groupcard_cost_type_mean = card_train.groupby(['cost_type','stu_id'])[['cost_amount']].mean().rename(columns = {'cost_amount':'cost_amount_mean'})
+groupcard_cost_type_count = card_train.groupby(['cost_type','stu_id'])[['cost_amount']].count().rename(columns = {'cost_amount':'cost_type_count'})
+groupcard_cost_reason_count = card_train.groupby(['cost_reason','stu_id'])[['cost_amount']].count().rename(columns = {'cost_amount':'cost_reason_count'})
+groupcard = card_train.groupby(['cost_reason','stu_id'])[['cost_amount']].sum().rename(columns = {'cost_amount':'cost_amount_sum'})
 groupborrow = borrow_train.groupby(['book_type','stu_id'])[['book_name']].count().rename(columns = {'book_name':'borrow_count'}).sum(level = 1).reset_index()
 grouplibrary = library_train.groupby('stu_id',as_index = False)[['time']].count().rename(columns = {'time':'libraryCount'})
 groupdorm = dorm_train.groupby(['direction','stu_id'])[['act_time']].count().rename(columns = {'act_time':'dormCount'})
-
+groupbyweekend = card_train.groupby(['weekend','stu_id'])[['cost_amount']].sum().rename(columns = {'cost_amount':'cost_amount_sum'})
+groupbyweekday = card_train.groupby(['weekday','stu_id'])[['cost_amount']].sum().rename(columns = {'cost_amount':'cost_amount_sum'})
+#[card_train.cost_reason =='食堂']
 def groupMerge(target,data,col):
     index1 = data.index.levels[0]
     for i_index in index1:
         tmp = data.ix[i_index].reset_index().rename(columns = {col:col+str(i_index)})
         target = target.merge(tmp,on = 'stu_id',how = 'left')
     return target
-#features (简单)
+
+##关联features (简单特征)
 train_data = subsidy_train.copy()
-train_data = train_data.merge(score_train,on = 'stu_id',how = 'left').fillna(-1)
-train_data = groupMerge(train_data,groupcard,'cost_amount').fillna(0)
+train_data = train_data.merge(score_train,on = 'stu_id',how = 'left').fillna(0)
+train_data = groupMerge(train_data,groupcard,'cost_amount_sum').fillna(0)
 train_data = train_data.merge(groupborrow,on = 'stu_id',how = 'left').fillna(0)
 train_data = train_data.merge(grouplibrary,on = 'stu_id',how = 'left').fillna(0)
-train_data = groupMerge(train_data,groupdorm,'dormCount').fillna(-1)
-#构造模型
+train_data = groupMerge(train_data,groupdorm,'dormCount').fillna(0)
+train_data = groupMerge(train_data,groupcard_cost_mean,'cost_amount_mean').fillna(0)
+train_data = train_data.merge(cost_sum,on = 'stu_id',how = 'left').fillna(0)
+train_data = train_data.merge(rest_mean,on = 'stu_id',how = 'left').fillna(0)
+train_data = groupMerge(train_data,groupcard_cost_type_sum,'cost_amount_sum').fillna(0)
+train_data = groupMerge(train_data,groupcard_cost_type_mean,'cost_amount_mean').fillna(0)
+train_data = groupMerge(train_data,groupcard_cost_type_count,'cost_type_count').fillna(0)
+train_data = groupMerge(train_data,groupcard_cost_reason_count,'cost_reason_count').fillna(0)
+train_data = train_data.merge(user_card_last_time,on = 'stu_id').fillna(0)
+train_data = train_data.merge(user_card_date_counts,on = 'stu_id').fillna(0)
+train_data = groupMerge(train_data,groupbyweekend,'cost_amount_sum').fillna(0)
+train_data = groupMerge(train_data,groupbyweekday,'cost_amount_sum').fillna(0)
+
+##构造模型
 feature = list(train_data.columns)
 feature.remove('subsidy')
+
+train_X = train_data[[
+'department_id',
+'cost_amount_mean卡片销户',
+'cost_amount_sumnot_weekend',
+'cost_amount_mean卡补办',
+'cost_amount_sum卡补办',
+'cost_amount_mean圈存转账',
+'cost_amount_sumweekend',
+'cost_reason_count食堂',
+'cost_type_countPOS消费',
+'cost_amount_mean洗衣房',
+'cost_amount_sum食堂',
+'cost_reason_count文印中心',
+'cost_reason_count超市',
+'cost_reason_count开水',
+'cost_reason_count图书馆',
+'cost_type_count卡充值',
+'cost_amount_meanPOS消费',
+'cost_amount_sum开水',
+'cost_reason_count洗衣房',
+'cost_reason_count校车',
+'cost_amount_sum7',
+'cost_amount_sum4',
+'dormCount1',
+'cost_amount_sum超市',
+'cost_amount_mean校车',
+'rest_amount_mean',
+'dormCount0',
+'cost_amount_sum校车',
+'cost_amount_mean开水',
+'cost_amount_sum6',
+'cost_amount_sum3',
+'cost_amount_sum2',
+'cost_amount_sum5',
+'count_date',
+'cost_amount_sum卡充值',
+'cost_amount_mean食堂',
+'cost_amount_sum教务处',
+'cost_reason_count淋浴',
+'cost_amount_sum1',
+'cost_amount_mean教务处',
+'cost_amount_sum图书馆',
+'rank',
+'cost_amount_sum淋浴',
+'cost_amount_mean卡充值',
+'cost_amount_sum洗衣房',
+'cost_amount_mean淋浴',
+'cost_amount_mean超市',
+'libraryCount',
+'borrow_count',
+'cost_amount_sum文印中心',
+'cost_amount_mean图书馆',
+'cost_amount_mean文印中心',
+'stu_id'
+]]
 train_X = train_data[feature]
 train_y = train_data['subsidy'].replace({1000:1,1500:2,2000:3})
 
-X_train_raw,X_test_raw,y_train,y_test = train_test_split(train_X,train_y,train_size = 0.5)  #没有成绩的到底要不要加？
+##分提取1000 1500 2000 的学生
+#train_1000 = np.zeros(len(train_y))
+#train_1500 = np.zeros(len(train_y))
+#train_2000 = np.zeros(len(train_y))
+#
+#train_1000[train_y[train_y==1].index] = 1
+#train_1500[train_y[train_y==2].index] = 1
+#train_2000[train_y[train_y==3].index] = 1
 
+def find_seq(data):
+    count = data.value_counts().to_frame()
+    count.sort_values(by = 'cluster',inplace = True,ascending = False)
+    count['order'] = np.arange(4)
+    data = data.replace(dict(zip(count.index,count.order)))
+    return data.values
 
+#from sklearn.preprocessing import StandardScaler,MinMaxScaler,Normalizer   #标准化
+#K_feat = feature
+#X = train_data[K_feat].values
+#Scaler = Normalizer()
+#X = Scaler.fit_transform(X)
+#kmeans = KMeans(n_clusters=4)
+#kmeans.fit(X)
+#train_data['cluster'] = kmeans.labels_
+#ans = find_seq(train_data['cluster'])
+#dp.classifiactin_result(train_y,ans)
 
+X_train_raw,X_test_raw,y_train,y_test = train_test_split(train_X,train_y,train_size = 0.8)  #没有成绩的到底要不要加？
 
-def xgb_train(X_train_raw,y_train,X_test_raw,y_test):
-    param = {}  
+#LR
+#from sklearn.linear_model.logistic import LogisticRegression
+#clf = LogisticRegression(multi_class = 'multinomial',solver = 'newton-cg')
+#clf.fit(X_train_raw,y_train)
+#predict = clf.predict(X_test_raw)
+#dp.classifiactin_result(y_test,predict)
+
+from sklearn.metrics import f1_score
+def f1(y_test,predict):
+    y_test1000 = y_test.apply(lambda x:1 if x ==1 else 0).values
+    y_test1500 = y_test.apply(lambda x:1 if x ==2 else 0).values
+    y_test2000 = y_test.apply(lambda x:1 if x ==3 else 0).values
+    predict_1000 = np.zeros(len(y_test))
+    predict_1500 = np.zeros(len(y_test))
+    predict_2000 = np.zeros(len(y_test))
+    predict_1000[predict==1] =1
+    predict_1500[predict==2] =1
+    predict_2000[predict==3] =1
+    gf1 = f1_score(y_test1000,predict_1000) * y_test.value_counts()[1]/len(y_test) +\
+        f1_score(y_test1500,predict_1500) * y_test.value_counts()[2]/len(y_test) +\
+        f1_score(y_test2000,predict_2000) * y_test.value_counts()[3]/len(y_test)   
+    return gf1
+#线下测试集
+def xgb_train_test(X_train_raw,y_train,X_test_raw,y_test):
+    param = {}
     # use softmax multi-class classification  
-    param['objective'] = 'multi:softmax'  
-    param['eta'] = 0.1  
-    param['max_depth'] = 6  
-    param['silent'] = 0  
+    param['objective'] = 'multi:softmax'
+    #param['objective'] = 'binary:logistic'
+    param['eta'] = 0.1
+    param['max_depth'] = 8
+    param['silent'] = 1
     param['nthread'] = 4
-    param['subsample'] = 0.9
-    param['colsample_bytree']= 0.9
-    param['min_child_weight'] = 10
+    param['subsample'] = 0.5
+    param['colsample_bytree']= 0.8
+    param['min_child_weight'] = 5
     param['booster'] = "gbtree"
-    param['seed'] = 2016   
+    param['seed'] = 2016
     param['num_class'] = 4  
-    num_round = 120
+    num_round = 115
     Dtrain = xgb.DMatrix(X_train_raw,label = y_train)
     Dtest = xgb.DMatrix(X_test_raw,label = y_test)
     watchlist  = [(Dtrain,'train'),(Dtest,'test')]
     clf = xgb.train(param,Dtrain,num_round,watchlist)
     return clf,Dtest
-
-clf,Dtest = xgb_train(X_train_raw,y_train,X_test_raw,y_test)
-predict = clf.predict(Dtest)
+clf_test,Dtest = xgb_train_test(X_train_raw,y_train,X_test_raw,y_test)
+predict = clf_test.predict(Dtest)
 dp.classifiactin_result(y_test,predict)
+print 'gf1:',f1(y_test,predict)
 
-clf.save_model(r'.\model\myxgb_1.m')  
+##gf1: 0.011549922613  12(200) gf1: 0.0134958753421 5(270)  gf1: 0.0159580663146  5(115)     
+
+###训练线上模型
+def xgb_train(train_X,train_y):
+    param = {}
+    # use softmax multi-class classification  
+    param['objective'] = 'multi:softmax'
+    #param['objective'] = 'binary:logistic'
+    param['eta'] = 0.1
+    param['max_depth'] = 8
+    param['silent'] = 1
+    param['nthread'] = 4
+    param['subsample'] = 0.5
+    param['colsample_bytree']= 0.8
+    param['min_child_weight'] = 5
+    param['booster'] = "gbtree"
+    param['seed'] = 2016
+    param['num_class'] = 4  
+    num_round = 300
+    Dtrain = xgb.DMatrix(train_X,label = train_y)
+    watchlist  = [(Dtrain,'train')]
+    clf = xgb.train(param,Dtrain,num_round,watchlist)
+    return clf,Dtrain
+clf,Dtrain = xgb_train(train_X,train_y)
+predict_train = clf.predict(Dtrain)
+dp.classifiactin_result(train_y,predict_train)
+print 'gf1:',f1(train_y,predict_train)
+
+#featuer Importance
+fscore = pd.Series(clf.get_fscore()).sort_values()
+less_Importantfeature = list(fscore.index)
+for feature in less_Importantfeature:
+    print feature
+
+
+clf.save_model(r'.\model\myxgb_5.m')  
+##
+
+
+
